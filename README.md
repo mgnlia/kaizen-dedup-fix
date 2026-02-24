@@ -1,43 +1,38 @@
 # kaizen-dedup-fix
 
-DB-backed message deduplication fix for the multi-agent duplicate delivery loop.
+DB-backed message dedup fix for the `guzus/office` backend.
 
-## Root Cause
+## Problem
 
-Agents session-replay their last outbound `send_message` on re-initialization.
-The prior in-memory `Map` dedup cache was wiped on every restart — exactly when
-the replay fires — making it useless.
+`routedEventCache` was a plain `new Map()` — wiped on every process restart.
+This caused agents to replay their last `send_message` on re-initialization,
+producing duplicate delivery loops (Jin 4x, Dev 3x, Scout post-retirement).
 
 ## Fix
 
-**`src/message-dedup.ts`** — DB-backed dedup module (no schema migration needed):
-- Queries the existing `messages` table for identical `(toAgentId, content)` pairs
-  within a 72-hour window before allowing delivery
-- Normalizes whitespace before hashing so minor formatting differences don't bypass
-- Fails open on DB error (never blocks agents)
-- Survives restarts because it reads from PostgreSQL, not process memory
+Six targeted patches to `packages/backend/dist/index.js`:
 
-**`src/manager.patch.ts`** — Four patches to `packages/backend/src/agents/manager.ts`:
-1. `ensureAgentStarted`: hard-block if `agent.status === 'stopped'`
-2. `reconcileAgentStatesOnStartup`: skip stopped agents (was promoting all `thinking/executing` → `idle`)
-3. `sendMessageToAgent`: call `isDuplicateMessage()` before inserting message + triggering loop
-4. `registerSendMessageHandler`: block inter-agent delivery to stopped agents
+| # | Target | Change |
+|---|--------|--------|
+| 1 | `reconcileAgentStatesOnStartup` | Skip agents with `status=stopped` — no forced reset to idle |
+| 2 | `ensureAgentStarted` | Hard-block if `agent.status=stopped` — throw, no silent restart |
+| 3 | `initSchema` | `CREATE TABLE message_dedup (dedup_key TEXT PK, seen_at_ms BIGINT)` + startup prune |
+| 4 | `shouldRouteMessage` | Promote to `async` |
+| 5 | `shouldRouteMessage` | After in-memory pass: DB SELECT → reject if within TTL, else UPSERT |
+| 6 | `communicate()` | `await shouldRouteMessage(...)` (was sync) |
 
-**`src/scheduler.patch.ts`** — Two patches to `packages/backend/src/scheduler/jobs.ts`:
-1. `pickAssignee`: filter stopped agents before role matching
-2. `resumeAssignedInProgressTasksAfterRestart`: skip stopped agents on startup
+## Survival guarantee
 
-## Verification
+On restart:
+1. `initSchema` runs → `message_dedup` table created (idempotent)
+2. Stale entries older than 72h pruned
+3. First `send_message` call hits DB: if key exists and `seen_at_ms` is within 30-min TTL → rejected
+4. In-memory `Map` is a fast-path cache; DB is the authoritative cross-restart store
 
-Fix survives restart because dedup state lives in PostgreSQL `messages` table,
-not in process memory. On restart:
-1. Scheduler calls `resumeAssignedInProgressTasksAfterRestart`
-2. For each in-progress task, it would normally send a resume message
-3. `sendMessageToAgent` calls `isDuplicateMessage(agentId, content)`
-4. Query finds the identical resume message already delivered → drops it
-5. No duplicate delivery
+## Fallback
 
-## Applied To
+If DB is unavailable, the `try/catch` in patch 5 swallows the error and falls through to the existing in-memory guard. No regression.
 
-- `guzus/office` main branch
-- Files: `packages/backend/src/agents/manager.ts`, `packages/backend/src/scheduler/jobs.ts`
+## Applied to
+
+`guzus/office` — `packages/backend/dist/index.js`
